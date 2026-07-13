@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Feature engineering pipeline for chest CT scans.
-Extracts radiomic and deep features for model training.
-Uses VGG16 for deep feature extraction (consistent with deployment).
+Used ONLY for drift detection, NOT for model training.
 """
 import os
 import cv2
@@ -25,11 +24,7 @@ logger = logging.getLogger(__name__)
 class FeaturePipeline:
     """
     Feature extraction pipeline for chest CT images.
-    
-    Extracts:
-    1. Deep features (VGG16 - consistent with deployment)
-    2. Radiomic features (shape, intensity, texture)
-    3. Combines and reduces dimensions with PCA
+    USED ONLY FOR DRIFT DETECTION - NOT FOR TRAINING!
     """
     
     def __init__(self, config: Optional[Dict] = None):
@@ -48,7 +43,7 @@ class FeaturePipeline:
                 include_top=False,
                 pooling='avg'
             )
-            logger.info("✅ Loaded VGG16 for feature extraction")
+            logger.info("✅ Loaded VGG16 for drift detection features")
         return self.base_model
     
     def extract_deep_features(self, image_path: Path) -> Optional[np.ndarray]:
@@ -128,40 +123,22 @@ class FeaturePipeline:
     
     def extract_features(self, data_path: Path) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
         """
-        Extract all features from dataset
-        
-        Returns:
-            Tuple of (features, labels, metadata)
+        Extract features from dataset
+        USED ONLY FOR DRIFT DETECTION
         """
         image_paths = []
         labels = []
         
-        # ✅ FIX: Recursively find all images in subdirectories
-        logger.info(f"Searching for images in: {data_path}")
-        
-        # Walk through all subdirectories
+        # Collect all images
         for root, dirs, files in os.walk(data_path):
             for file in files:
                 if file.lower().endswith(('.png', '.jpg', '.jpeg')):
                     full_path = Path(root) / file
                     image_paths.append(full_path)
-                    # Use parent directory name as label
                     labels.append(Path(root).name)
-                    logger.debug(f"Found image: {full_path} with label: {Path(root).name}")
         
-        # ✅ FIX: If no images found, try different directory depth
-        if len(image_paths) == 0:
-            logger.warning(f"No images found in {data_path}, trying alternative search...")
-            # Try one level deeper
-            for subdir in data_path.iterdir():
-                if subdir.is_dir():
-                    for img_path in subdir.glob('*.[jp][pn][g]'):
-                        image_paths.append(img_path)
-                        labels.append(subdir.name)
+        logger.info(f"Found {len(image_paths)} images for drift detection")
         
-        logger.info(f"Found {len(image_paths)} images")
-        
-        # ✅ FIX: Handle case with no images
         if len(image_paths) == 0:
             logger.error(f"No images found in {data_path}")
             return np.array([]), np.array([]), pd.DataFrame()
@@ -190,9 +167,8 @@ class FeaturePipeline:
                 'size': img_path.stat().st_size
             })
         
-        # ✅ FIX: Check if any features were extracted
         if len(all_features) == 0:
-            logger.error("No features could be extracted from images")
+            logger.error("No features could be extracted")
             return np.array([]), np.array([]), pd.DataFrame()
         
         # Convert to arrays
@@ -201,11 +177,10 @@ class FeaturePipeline:
         metadata_df = pd.DataFrame(metadata)
         
         # Store feature names
-        deep_length = len(deep) if 'deep' in locals() else all_features[0].shape[0] - len(radio)
-        self.feature_names = [f'deep_{i}' for i in range(deep_length)]
+        self.feature_names = [f'deep_{i}' for i in range(all_features[0].shape[0] - len(radio))]
         self.feature_names.extend(list(radio.keys()))
         
-        logger.info(f"Extracted {X.shape[1]} features from {X.shape[0]} images")
+        logger.info(f"Extracted {X.shape[1]} features for drift detection")
         
         return X, y, metadata_df
     
@@ -215,16 +190,13 @@ class FeaturePipeline:
             logger.error("No data to fit")
             return np.array([])
             
-        # Scale features
         X_scaled = self.scaler.fit_transform(X)
         
-        # Apply PCA if configured
         if self.config.get('use_pca', True) and X_scaled.shape[1] > 0:
             n_components = min(self.config.get('pca_components', 50), X_scaled.shape[1])
             self.pca = PCA(n_components=n_components)
             X_transformed = self.pca.fit_transform(X_scaled)
-            logger.info(f"PCA reduced dimensions from {X_scaled.shape[1]} to {n_components}")
-            logger.info(f"Explained variance: {self.pca.explained_variance_ratio_.sum():.2%}")
+            logger.info(f"PCA reduced dimensions to {n_components} for drift detection")
         else:
             X_transformed = X_scaled
         
@@ -255,7 +227,7 @@ class FeaturePipeline:
             joblib.dump(self.pca, output_dir / 'pca.pkl')
         with open(output_dir / 'feature_names.txt', 'w') as f:
             f.write('\n'.join(self.feature_names))
-        logger.info(f"✅ Saved feature pipeline to {output_dir}")
+        logger.info(f"✅ Saved feature pipeline (drift detection only) to {output_dir}")
     
     def load(self, output_dir: Path):
         """Load fitted transformers"""

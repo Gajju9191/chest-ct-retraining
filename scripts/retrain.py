@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-Enhanced AWS Batch Retraining Script with:
-- VGG16 Model (consistent with deployment)
-- Feature Engineering Pipeline (VGG16)
-- Pre-training Drift Detection
-- AWS Secrets Manager Integration
-- MLflow Tracking
-- Model Comparison & Deployment
+Retraining Pipeline with VGG16 on Raw Images
+- Consistent with deployment model
+- Feature pipeline used ONLY for drift detection
+- Fair model comparison
 """
 import os
 import sys
@@ -28,7 +25,6 @@ import zipfile
 from feature_pipeline import FeaturePipeline
 from training_drift import TrainingDriftDetector
 from secrets_manager import SecretsManager
-from model_comparator import ModelComparator
 
 # Configure logging
 logging.basicConfig(
@@ -65,26 +61,21 @@ JENKINS_USERNAME = jenkins_creds.get('username', 'Gajanan Wagalgave')
 JENKINS_API_TOKEN = jenkins_creds.get('api_token', '')
 JOB_NAME = "ecs-cicd-d"
 
-# Deployment credentials
-deploy_creds = secrets.get_deployment_credentials()
-if deploy_creds:
-    logger.info("✅ Deployment credentials loaded")
-
 # ============================================================
 # CONFIGURATION
 # ============================================================
 IMPROVEMENT_THRESHOLD = 1.0  # Minimum improvement to deploy (%)
 DRIFT_THRESHOLD = 15.0  # Drift percentage to trigger retraining
 
-# VGG16 Training parameters
+# VGG16 Training parameters (CONSISTENT with deployment)
 BATCH_SIZE = 12
 EPOCHS = 10
 LEARNING_RATE = 0.001
 VALIDATION_SPLIT = 0.2
-IMAGE_SIZE = (224, 224, 3)
+IMAGE_SIZE = (224, 224)
 
 # ============================================================
-# DATA LOADING FUNCTIONS
+# DATA LOADING
 # ============================================================
 
 def download_training_data():
@@ -107,46 +98,50 @@ def download_training_data():
         raise
 
 # ============================================================
-# VGG16 MODEL FUNCTIONS
+# VGG16 MODEL (CONSISTENT WITH DEPLOYMENT)
 # ============================================================
 
-def get_vgg16_base_model():
-    """Load VGG16 base model with ImageNet weights"""
-    logger.info("🔄 Loading VGG16 base model...")
+def create_vgg16_model():
+    """Create VGG16 model - IDENTICAL to deployment model"""
+    from tensorflow.keras.applications import VGG16
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D, BatchNormalization
+    from tensorflow.keras.optimizers import Adam
     
-    base_model = tf.keras.applications.VGG16(
-        input_shape=IMAGE_SIZE,
+    logger.info("🔄 Creating VGG16 model (identical to deployment)...")
+    
+    base_model = VGG16(
         weights='imagenet',
-        include_top=False
+        include_top=False,
+        input_shape=(224, 224, 3)
     )
     base_model.trainable = False
     
-    # Add custom head
-    model = tf.keras.Sequential([
+    model = Sequential([
         base_model,
-        tf.keras.layers.Flatten(),
-        tf.keras.layers.Dense(128, activation='relu'),
-        tf.keras.layers.Dropout(0.5),
-        tf.keras.layers.Dense(2, activation='softmax')
+        GlobalAveragePooling2D(),
+        Dense(128, activation='relu'),
+        Dropout(0.5),
+        Dense(2, activation='softmax')
     ])
     
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+        optimizer=Adam(learning_rate=LEARNING_RATE),
         loss='categorical_crossentropy',
         metrics=['accuracy']
     )
     
-    logger.info("✅ VGG16 model created with custom head")
+    logger.info("✅ VGG16 model created (identical to deployment)")
     return model
 
 
-def train_vgg16_model(model, train_data_path, val_data_path):
-    """Train VGG16 model on images"""
+def train_vgg16_model(model, data_path):
+    """Train VGG16 on raw images"""
     from tensorflow.keras.preprocessing.image import ImageDataGenerator
     from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
     
-    # Data augmentation
-    train_datagen = ImageDataGenerator(
+    # Data augmentation (same as deployment)
+    datagen = ImageDataGenerator(
         rescale=1./255,
         rotation_range=20,
         width_shift_range=0.2,
@@ -154,34 +149,34 @@ def train_vgg16_model(model, train_data_path, val_data_path):
         shear_range=0.2,
         zoom_range=0.2,
         horizontal_flip=True,
-        fill_mode='nearest'
+        fill_mode='nearest',
+        validation_split=VALIDATION_SPLIT
     )
     
-    val_datagen = ImageDataGenerator(rescale=1./255)
-    
-    train_generator = train_datagen.flow_from_directory(
-        train_data_path,
-        target_size=IMAGE_SIZE[:-1],
+    train_generator = datagen.flow_from_directory(
+        data_path,
+        target_size=IMAGE_SIZE,
         batch_size=BATCH_SIZE,
         class_mode='categorical',
+        subset='training',
         shuffle=True
     )
     
-    val_generator = val_datagen.flow_from_directory(
-        val_data_path,
-        target_size=IMAGE_SIZE[:-1],
+    val_generator = datagen.flow_from_directory(
+        data_path,
+        target_size=IMAGE_SIZE,
         batch_size=BATCH_SIZE,
         class_mode='categorical',
+        subset='validation',
         shuffle=False
     )
     
-    # Callbacks
+    logger.info(f"🚀 Training VGG16 on {train_generator.samples} images...")
+    
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-7)
     ]
-    
-    logger.info(f"🚀 Training VGG16 on {train_generator.samples} images...")
     
     history = model.fit(
         train_generator,
@@ -197,21 +192,86 @@ def train_vgg16_model(model, train_data_path, val_data_path):
     val_accuracy = history.history['val_accuracy'][-1]
     logger.info(f"✅ Training complete. Accuracy: {final_accuracy:.4f}, Val Accuracy: {val_accuracy:.4f}")
     
-    return model, history
+    return model, train_generator, val_generator, history
 
+# ============================================================
+# DRIFT DETECTION (Pre-training check)
+# ============================================================
+
+def check_data_drift(data_path):
+    """Run drift detection on new training data"""
+    logger.info("📊 Running pre-training drift detection...")
+    
+    # Extract features for drift detection (MONITORING ONLY)
+    feature_pipeline = FeaturePipeline({
+        'use_pca': True,
+        'pca_components': 50
+    })
+    
+    # Extract features (only for drift detection)
+    X, y, metadata = feature_pipeline.extract_features(data_path)
+    X_transformed = feature_pipeline.fit_transform(X)
+    
+    # Save feature pipeline for later use
+    feature_pipeline.save(Path('/tmp/feature_pipeline'))
+    
+    # Initialize drift detector
+    drift_detector = TrainingDriftDetector(
+        threshold=0.05,
+        feature_names=feature_pipeline.feature_names
+    )
+    
+    # Load reference data from S3 if exists
+    try:
+        s3 = boto3.client('s3')
+        s3.download_file(MODEL_BUCKET, 'reference_features.npy', '/tmp/reference_features.npy')
+        reference_data = np.load('/tmp/reference_features.npy')
+        drift_detector.compute_reference_stats(reference_data)
+        logger.info("✅ Loaded reference data from S3")
+    except:
+        logger.info("ℹ️ No reference data found. Using current batch as reference.")
+    
+    # Detect drift
+    drift_report = drift_detector.detect_drift(
+        X_transformed,
+        metadata,
+        batch_id=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+    
+    # Save drift report
+    drift_detector.save_report(drift_report, MODEL_BUCKET)
+    
+    # Log drift metrics
+    mlflow.log_metrics({
+        "drift_percentage": drift_report['drift_percentage'],
+        "drifted_features": drift_report['drifted_features']
+    })
+    
+    # Save reference data for future
+    np.save('/tmp/reference_features.npy', X_transformed)
+    s3 = boto3.client('s3')
+    s3.upload_file('/tmp/reference_features.npy', MODEL_BUCKET, 'reference_features.npy')
+    
+    return drift_report
+
+# ============================================================
+# MODEL COMPARISON (Fair comparison)
+# ============================================================
 
 def compare_models(new_model, val_generator):
-    """Compare new VGG16 model with production model"""
+    """Compare new model with production model on same validation set"""
+    from tensorflow.keras.models import load_model
+    
     # Evaluate new model
     new_loss, new_accuracy = new_model.evaluate(val_generator, verbose=0)
     logger.info(f"📊 New Model Accuracy: {new_accuracy:.4f}")
     
-    # Download production model
+    # Download and evaluate production model
     s3 = boto3.client('s3')
     prod_path = '/tmp/production_model.h5'
     try:
         s3.download_file(MODEL_BUCKET, 'production/model.h5', prod_path)
-        prod_model = tf.keras.models.load_model(prod_path)
+        prod_model = load_model(prod_path)
         prod_loss, prod_accuracy = prod_model.evaluate(val_generator, verbose=0)
         
         if prod_accuracy > 0:
@@ -288,9 +348,9 @@ def trigger_jenkins():
 # ============================================================
 
 def main():
-    """Main retraining pipeline with VGG16, feature engineering, and drift detection"""
+    """Main retraining pipeline with VGG16 on raw images"""
     logger.info("=" * 60)
-    logger.info("🔄 Starting VGG16 Retraining Pipeline with Drift Detection")
+    logger.info("🔄 Starting VGG16 Retraining Pipeline (Raw Images)")
     logger.info("=" * 60)
     
     try:
@@ -305,98 +365,29 @@ def main():
                 "validation_split": VALIDATION_SPLIT,
                 "drift_threshold": DRIFT_THRESHOLD,
                 "improvement_threshold": IMPROVEMENT_THRESHOLD,
-                "model_bucket": MODEL_BUCKET,
-                "data_bucket": DATA_BUCKET
+                "training_data": "raw_images"
             })
             
             # Step 1: Download data
             logger.info("📥 Downloading training data...")
             data_path = download_training_data()
             
-            # Step 2: Create VGG16 model
-            model = get_vgg16_base_model()
+            # Step 2: Check data drift (pre-training check)
+            drift_report = check_data_drift(data_path)
+            logger.info(f"📊 Drift: {drift_report['drift_percentage']:.1f}% - {drift_report['recommendation']}")
             
-            # Step 3: Load validation generator for drift detection
-            from tensorflow.keras.preprocessing.image import ImageDataGenerator
+            # Step 3: Create VGG16 model (identical to deployment)
+            model = create_vgg16_model()
             
-            val_datagen = ImageDataGenerator(rescale=1./255, validation_split=VALIDATION_SPLIT)
-            val_generator = val_datagen.flow_from_directory(
-                data_path,
-                target_size=IMAGE_SIZE[:-1],
-                batch_size=BATCH_SIZE,
-                class_mode='categorical',
-                subset='validation',
-                shuffle=False
-            )
+            # Step 4: Train on raw images
+            model, train_generator, val_generator, history = train_vgg16_model(model, data_path)
             
-            # Step 4: Pre-training drift detection using VGG16 feature extraction
-            logger.info("📊 Detecting data drift using VGG16 features...")
-            
-            # Extract features from validation data for drift detection
-            feature_pipeline = FeaturePipeline({
-                'use_pca': True,
-                'pca_components': 50
-            })
-            
-            # Use feature pipeline to extract features
-            X, y, metadata = feature_pipeline.extract_features(data_path)
-            X_transformed = feature_pipeline.fit_transform(X)
-            
-            # Save feature pipeline
-            feature_pipeline.save(Path('/tmp/feature_pipeline'))
-            
-            # Initialize drift detector
-            drift_detector = TrainingDriftDetector(
-                threshold=0.05,
-                feature_names=feature_pipeline.feature_names
-            )
-            
-            # Load reference data from S3 if exists
-            try:
-                s3 = boto3.client('s3')
-                s3.download_file(MODEL_BUCKET, 'reference_features.npy', '/tmp/reference_features.npy')
-                reference_data = np.load('/tmp/reference_features.npy')
-                drift_detector.compute_reference_stats(reference_data)
-                logger.info("✅ Loaded reference data from S3")
-            except:
-                logger.info("ℹ️ No reference data found. Using current batch as reference.")
-            
-            # Detect drift
-            drift_report = drift_detector.detect_drift(
-                X_transformed,
-                metadata,
-                batch_id=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            )
-            
-            # Save drift report
-            drift_detector.save_report(drift_report, MODEL_BUCKET)
-            
-            # Log drift metrics
-            mlflow.log_metrics({
-                "drift_percentage": drift_report['drift_percentage'],
-                "drifted_features": drift_report['drifted_features']
-            })
-            
-            # Step 5: Train VGG16 model
-            logger.info("🏋️ Training VGG16 model...")
-            
-            train_generator = val_datagen.flow_from_directory(
-                data_path,
-                target_size=IMAGE_SIZE[:-1],
-                batch_size=BATCH_SIZE,
-                class_mode='categorical',
-                subset='training',
-                shuffle=True
-            )
-            
-            model, history = train_vgg16_model(model, data_path, data_path)
-            
-            # Step 6: Save model
+            # Step 5: Save model
             model_path = '/tmp/model.h5'
             model.save(model_path)
             logger.info(f"✅ Model saved to {model_path}")
             
-            # Step 7: Compare models
+            # Step 6: Compare with production model
             logger.info("⚖️ Comparing models...")
             comparison = compare_models(model, val_generator)
             
@@ -406,7 +397,7 @@ def main():
                 "improvement": comparison['improvement']
             })
             
-            # Step 8: Deploy if improved
+            # Step 7: Deploy if improved
             if comparison['should_deploy']:
                 logger.info(f"✅ Model improved by {comparison['improvement']:.2f}%")
                 version = upload_model_to_s3(model_path)
@@ -416,11 +407,6 @@ def main():
             else:
                 logger.info(f"⏸️ No significant improvement: {comparison['improvement']:.2f}%")
                 mlflow.log_param("deployed", False)
-            
-            # Step 9: Save reference data for future
-            np.save('/tmp/reference_features.npy', X_transformed)
-            s3 = boto3.client('s3')
-            s3.upload_file('/tmp/reference_features.npy', MODEL_BUCKET, 'reference_features.npy')
             
             logger.info("=" * 60)
             logger.info("✅ Retraining pipeline completed successfully!")

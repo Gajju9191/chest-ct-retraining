@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 AWS Secrets Manager integration for secure credential management.

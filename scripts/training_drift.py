@@ -1,12 +1,11 @@
-
 #!/usr/bin/env python3
 """
 Pre-training drift detection for validating new data batches.
 """
 import numpy as np
 import pandas as pd
-from scipy.stats import ks_2samp, chi2_contingency
-from typing import Dict, List, Any, Optional, Tuple
+from scipy.stats import ks_2samp
+from typing import Dict, List, Any, Optional
 from datetime import datetime
 import json
 import boto3
@@ -19,9 +18,7 @@ logger = logging.getLogger(__name__)
 class TrainingDriftDetector:
     """
     Detect data drift in new training batches.
-    
-    Compares new data distribution against reference data
-    using statistical tests (KS test, Chi-square).
+    Used as a quality gate before retraining.
     """
     
     def __init__(
@@ -62,14 +59,6 @@ class TrainingDriftDetector:
     ) -> Dict:
         """
         Detect drift in new data batch
-        
-        Args:
-            data: New feature matrix
-            metadata: Optional metadata for logging
-            batch_id: Optional batch identifier
-            
-        Returns:
-            Drift report with results
         """
         if batch_id is None:
             batch_id = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -135,12 +124,12 @@ class TrainingDriftDetector:
         if drift_percentage > 30:
             recommendations.append({
                 'type': 'critical',
-                'message': '🚨 High drift detected. Retrain immediately or investigate data pipeline.'
+                'message': '🚨 High drift detected. Investigate data pipeline before retraining.'
             })
         elif drift_percentage > 15:
             recommendations.append({
                 'type': 'warning',
-                'message': f'⚠️ Significant drift in {drifted_features} features. Schedule retraining soon.'
+                'message': f'⚠️ Significant drift in {drifted_features} features. Retrain soon.'
             })
         elif drift_percentage > 5:
             recommendations.append({
@@ -150,7 +139,7 @@ class TrainingDriftDetector:
         else:
             recommendations.append({
                 'type': 'success',
-                'message': '✅ No significant drift detected. Model is stable.'
+                'message': '✅ No significant drift detected. Proceed with retraining.'
             })
         
         report = {
@@ -166,8 +155,6 @@ class TrainingDriftDetector:
         }
         
         self.drift_history.append(report)
-        
-        # Log to MLflow
         self._log_to_mlflow(report)
         
         logger.info(f"📊 Drift detection: {drift_percentage:.1f}% drift detected")
@@ -204,7 +191,3 @@ class TrainingDriftDetector:
         except Exception as e:
             logger.error(f"❌ Failed to save drift report: {e}")
             return False
-    
-    def should_retrain(self, report: Dict, threshold: float = 15.0) -> bool:
-        """Determine if retraining is needed based on drift"""
-        return report['drift_percentage'] > threshold
