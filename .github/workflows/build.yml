@@ -1,10 +1,13 @@
-
 name: Build Training Image
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
+
+env:
+  REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+  IMAGE_NAME: chest-ct-training
 
 jobs:
   build-and-push:
@@ -27,6 +30,21 @@ jobs:
       
       - name: Build and push training image
         run: |
-          docker build -f Dockerfile.train -t chest-ct-training .
-          docker tag chest-ct-training:latest ${{ steps.login-ecr.outputs.registry }}/chest-ct-training:latest
-          docker push ${{ steps.login-ecr.outputs.registry }}/chest-ct-training:latest
+          echo "🔨 Building training image..."
+          docker build -f Dockerfile.train -t ${{ env.IMAGE_NAME }} .
+          
+          echo "📦 Tagging image..."
+          docker tag ${{ env.IMAGE_NAME }}:latest ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          
+          echo "⬆️ Pushing image to ECR..."
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          
+          echo "✅ Image pushed successfully!"
+          
+      - name: Show image digest
+        run: |
+          echo "Image details:"
+          aws ecr describe-images \
+            --repository-name ${{ env.IMAGE_NAME }} \
+            --query 'imageDetails[0].{Digest:imageDigest, Size:imageSizeInBytes, PushedAt:imagePushedAt}' \
+            --output table
