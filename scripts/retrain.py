@@ -1,9 +1,8 @@
-
 #!/usr/bin/env python3
 """
 Enhanced AWS Batch Retraining Script with:
 - VGG16 Model (consistent with deployment)
-- Feature Engineering Pipeline
+- Feature Engineering Pipeline (VGG16)
 - Pre-training Drift Detection
 - AWS Secrets Manager Integration
 - MLflow Tracking
@@ -23,6 +22,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 import requests
+import zipfile
 
 # Import modules
 from feature_pipeline import FeaturePipeline
@@ -84,7 +84,7 @@ VALIDATION_SPLIT = 0.2
 IMAGE_SIZE = (224, 224, 3)
 
 # ============================================================
-# VGG16 MODEL FUNCTIONS
+# DATA LOADING FUNCTIONS
 # ============================================================
 
 def download_training_data():
@@ -98,7 +98,6 @@ def download_training_data():
         s3.download_file(DATA_BUCKET, 'chest-data.zip', zip_path)
         logger.info("✅ Downloaded data from S3")
         
-        import zipfile
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(data_path)
         logger.info(f"✅ Extracted data to {data_path}")
@@ -107,6 +106,9 @@ def download_training_data():
         logger.error(f"❌ Data download failed: {e}")
         raise
 
+# ============================================================
+# VGG16 MODEL FUNCTIONS
+# ============================================================
 
 def get_vgg16_base_model():
     """Load VGG16 base model with ImageNet weights"""
@@ -311,15 +313,10 @@ def main():
             logger.info("📥 Downloading training data...")
             data_path = download_training_data()
             
-            # Step 2: Split into train/val
-            # (Using the existing data structure with class folders)
-            train_data_path = data_path
-            val_data_path = data_path  # Same path, using validation_split in flow_from_directory
-            
-            # Step 3: Create VGG16 model
+            # Step 2: Create VGG16 model
             model = get_vgg16_base_model()
             
-            # Step 4: Load validation generator for drift detection
+            # Step 3: Load validation generator for drift detection
             from tensorflow.keras.preprocessing.image import ImageDataGenerator
             
             val_datagen = ImageDataGenerator(rescale=1./255, validation_split=VALIDATION_SPLIT)
@@ -332,8 +329,8 @@ def main():
                 shuffle=False
             )
             
-            # Step 5: Pre-training drift detection using feature extraction
-            logger.info("📊 Detecting data drift...")
+            # Step 4: Pre-training drift detection using VGG16 feature extraction
+            logger.info("📊 Detecting data drift using VGG16 features...")
             
             # Extract features from validation data for drift detection
             feature_pipeline = FeaturePipeline({
@@ -360,8 +357,9 @@ def main():
                 s3.download_file(MODEL_BUCKET, 'reference_features.npy', '/tmp/reference_features.npy')
                 reference_data = np.load('/tmp/reference_features.npy')
                 drift_detector.compute_reference_stats(reference_data)
+                logger.info("✅ Loaded reference data from S3")
             except:
-                logger.info("No reference data found. Using current batch as reference.")
+                logger.info("ℹ️ No reference data found. Using current batch as reference.")
             
             # Detect drift
             drift_report = drift_detector.detect_drift(
@@ -379,7 +377,7 @@ def main():
                 "drifted_features": drift_report['drifted_features']
             })
             
-            # Step 6: Train VGG16 model
+            # Step 5: Train VGG16 model
             logger.info("🏋️ Training VGG16 model...")
             
             train_generator = val_datagen.flow_from_directory(
@@ -393,12 +391,12 @@ def main():
             
             model, history = train_vgg16_model(model, data_path, data_path)
             
-            # Step 7: Save model
+            # Step 6: Save model
             model_path = '/tmp/model.h5'
             model.save(model_path)
             logger.info(f"✅ Model saved to {model_path}")
             
-            # Step 8: Compare models
+            # Step 7: Compare models
             logger.info("⚖️ Comparing models...")
             comparison = compare_models(model, val_generator)
             
@@ -408,7 +406,7 @@ def main():
                 "improvement": comparison['improvement']
             })
             
-            # Step 9: Deploy if improved
+            # Step 8: Deploy if improved
             if comparison['should_deploy']:
                 logger.info(f"✅ Model improved by {comparison['improvement']:.2f}%")
                 version = upload_model_to_s3(model_path)
@@ -419,7 +417,7 @@ def main():
                 logger.info(f"⏸️ No significant improvement: {comparison['improvement']:.2f}%")
                 mlflow.log_param("deployed", False)
             
-            # Step 10: Save reference data for future
+            # Step 9: Save reference data for future
             np.save('/tmp/reference_features.npy', X_transformed)
             s3 = boto3.client('s3')
             s3.upload_file('/tmp/reference_features.npy', MODEL_BUCKET, 'reference_features.npy')

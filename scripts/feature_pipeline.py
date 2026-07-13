@@ -2,6 +2,7 @@
 """
 Feature engineering pipeline for chest CT scans.
 Extracts radiomic and deep features for model training.
+Uses VGG16 for deep feature extraction (consistent with deployment).
 """
 import os
 import cv2
@@ -10,8 +11,8 @@ import pandas as pd
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 import tensorflow as tf
-from tensorflow.keras.applications import MobileNetV2
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.applications.vgg16 import preprocess_input
 from skimage.feature import graycomatrix, graycoprops
 import joblib
 from sklearn.preprocessing import StandardScaler
@@ -26,7 +27,7 @@ class FeaturePipeline:
     Feature extraction pipeline for chest CT images.
     
     Extracts:
-    1. Deep features (MobileNetV2)
+    1. Deep features (VGG16 - consistent with deployment)
     2. Radiomic features (shape, intensity, texture)
     3. Combines and reduces dimensions with PCA
     """
@@ -40,17 +41,18 @@ class FeaturePipeline:
         self.is_fitted = False
         
     def _get_base_model(self):
-        """Load pre-trained MobileNetV2 for feature extraction"""
+        """Load pre-trained VGG16 for feature extraction"""
         if self.base_model is None:
-            self.base_model = MobileNetV2(
+            self.base_model = VGG16(
                 weights='imagenet',
                 include_top=False,
                 pooling='avg'
             )
+            logger.info("✅ Loaded VGG16 for feature extraction")
         return self.base_model
     
     def extract_deep_features(self, image_path: Path) -> Optional[np.ndarray]:
-        """Extract deep features using MobileNetV2"""
+        """Extract deep features using VGG16"""
         try:
             img = cv2.imread(str(image_path))
             if img is None:
@@ -148,7 +150,7 @@ class FeaturePipeline:
         metadata = []
         
         for img_path in image_paths:
-            # Deep features
+            # Deep features (VGG16)
             deep = self.extract_deep_features(img_path)
             if deep is None:
                 continue
