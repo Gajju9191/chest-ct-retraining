@@ -136,21 +136,42 @@ class FeaturePipeline:
         image_paths = []
         labels = []
         
-        # Collect all images
-        for class_dir in data_path.iterdir():
-            if class_dir.is_dir():
-                for img_path in class_dir.glob('*.[jp][pn][g]'):
-                    image_paths.append(img_path)
-                    labels.append(class_dir.name)
+        # ✅ FIX: Recursively find all images in subdirectories
+        logger.info(f"Searching for images in: {data_path}")
+        
+        # Walk through all subdirectories
+        for root, dirs, files in os.walk(data_path):
+            for file in files:
+                if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    full_path = Path(root) / file
+                    image_paths.append(full_path)
+                    # Use parent directory name as label
+                    labels.append(Path(root).name)
+                    logger.debug(f"Found image: {full_path} with label: {Path(root).name}")
+        
+        # ✅ FIX: If no images found, try different directory depth
+        if len(image_paths) == 0:
+            logger.warning(f"No images found in {data_path}, trying alternative search...")
+            # Try one level deeper
+            for subdir in data_path.iterdir():
+                if subdir.is_dir():
+                    for img_path in subdir.glob('*.[jp][pn][g]'):
+                        image_paths.append(img_path)
+                        labels.append(subdir.name)
         
         logger.info(f"Found {len(image_paths)} images")
+        
+        # ✅ FIX: Handle case with no images
+        if len(image_paths) == 0:
+            logger.error(f"No images found in {data_path}")
+            return np.array([]), np.array([]), pd.DataFrame()
         
         # Extract features
         all_features = []
         metadata = []
         
         for img_path in image_paths:
-            # Deep features (VGG16)
+            # Deep features
             deep = self.extract_deep_features(img_path)
             if deep is None:
                 continue
@@ -169,13 +190,19 @@ class FeaturePipeline:
                 'size': img_path.stat().st_size
             })
         
+        # ✅ FIX: Check if any features were extracted
+        if len(all_features) == 0:
+            logger.error("No features could be extracted from images")
+            return np.array([]), np.array([]), pd.DataFrame()
+        
         # Convert to arrays
         X = np.array(all_features)
-        y = np.array(labels)
+        y = np.array([m['label'] for m in metadata])
         metadata_df = pd.DataFrame(metadata)
         
         # Store feature names
-        self.feature_names = [f'deep_{i}' for i in range(deep.shape[0])]
+        deep_length = len(deep) if 'deep' in locals() else all_features[0].shape[0] - len(radio)
+        self.feature_names = [f'deep_{i}' for i in range(deep_length)]
         self.feature_names.extend(list(radio.keys()))
         
         logger.info(f"Extracted {X.shape[1]} features from {X.shape[0]} images")
@@ -184,12 +211,16 @@ class FeaturePipeline:
     
     def fit_transform(self, X: np.ndarray) -> np.ndarray:
         """Fit scaler and PCA, then transform features"""
+        if X is None or len(X) == 0:
+            logger.error("No data to fit")
+            return np.array([])
+            
         # Scale features
         X_scaled = self.scaler.fit_transform(X)
         
         # Apply PCA if configured
-        if self.config.get('use_pca', True):
-            n_components = self.config.get('pca_components', 50)
+        if self.config.get('use_pca', True) and X_scaled.shape[1] > 0:
+            n_components = min(self.config.get('pca_components', 50), X_scaled.shape[1])
             self.pca = PCA(n_components=n_components)
             X_transformed = self.pca.fit_transform(X_scaled)
             logger.info(f"PCA reduced dimensions from {X_scaled.shape[1]} to {n_components}")
@@ -205,6 +236,9 @@ class FeaturePipeline:
         if not self.is_fitted:
             raise ValueError("Pipeline not fitted. Call fit_transform first.")
         
+        if X is None or len(X) == 0:
+            return np.array([])
+            
         X_scaled = self.scaler.transform(X)
         if self.pca:
             X_transformed = self.pca.transform(X_scaled)
