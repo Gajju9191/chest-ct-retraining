@@ -69,12 +69,23 @@ output "cloudwatch_log_group" {
   value = aws_cloudwatch_log_group.batch.name
 }
 
+# ✅ FIXED: Use alarm_name instead of name
 output "cloudwatch_alarms" {
   description = "CloudWatch alarm names for monitoring"
   value = {
-    performance_drop = aws_cloudwatch_metric_alarm.model_performance_drop.name
-    drift_high       = aws_cloudwatch_metric_alarm.high_drift.name
-    batch_failure    = aws_cloudwatch_metric_alarm.batch_job_failure.name
+    performance_drop = aws_cloudwatch_metric_alarm.model_performance_drop.alarm_name
+    high_drift       = aws_cloudwatch_metric_alarm.high_drift.alarm_name
+    batch_failure    = aws_cloudwatch_metric_alarm.batch_job_failure.alarm_name
+  }
+}
+
+# ✅ NEW: CloudWatch alarm ARNs
+output "cloudwatch_alarm_arns" {
+  description = "CloudWatch alarm ARNs for monitoring"
+  value = {
+    performance_drop = aws_cloudwatch_metric_alarm.model_performance_drop.arn
+    high_drift       = aws_cloudwatch_metric_alarm.high_drift.arn
+    batch_failure    = aws_cloudwatch_metric_alarm.batch_job_failure.arn
   }
 }
 
@@ -82,6 +93,7 @@ output "cloudwatch_alarms" {
 # COMPLETE DEPLOYMENT INFORMATION
 # ============================================================
 
+# ✅ FIXED: Use alarm_name instead of name
 output "retraining_info" {
   description = "Complete retraining pipeline information"
   value = {
@@ -98,9 +110,9 @@ output "retraining_info" {
     alerts = {
       sns_topic = aws_sns_topic.alerts.arn
       alarms    = {
-        performance = aws_cloudwatch_metric_alarm.model_performance_drop.name
-        drift       = aws_cloudwatch_metric_alarm.high_drift.name
-        batch       = aws_cloudwatch_metric_alarm.batch_job_failure.name
+        performance = aws_cloudwatch_metric_alarm.model_performance_drop.alarm_name
+        drift       = aws_cloudwatch_metric_alarm.high_drift.alarm_name
+        batch       = aws_cloudwatch_metric_alarm.batch_job_failure.alarm_name
       }
     }
     logs = aws_cloudwatch_log_group.batch.name
