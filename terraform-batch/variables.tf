@@ -71,7 +71,7 @@ variable "dagshub_token" {
 variable "alert_email" {
   description = "Email address for alerts"
   type        = string
-  default     = "gajananw131gmail.com"
+  default     = "gajananw131@gmail.com"  # ✅ FIXED: Added @ symbol
 }
 
 variable "alert_phone" {
