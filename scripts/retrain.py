@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Retraining Pipeline with VGG16 on Raw Images
+Event-Driven Retraining Pipeline with VGG16
+- Triggers on: Data Drift, Performance Drop, New Data, Schedule
 - Consistent with deployment model
 - Feature pipeline used ONLY for drift detection
-- Fair model comparison
-- 15 epochs for better training
-- FIXED: Handles nested directory structure
 """
 import os
 import sys
@@ -37,7 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# SECRETS MANAGER - Fetch all credentials
+# SECRETS MANAGER
 # ============================================================
 secrets = SecretsManager()
 
@@ -60,17 +58,19 @@ AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 jenkins_creds = secrets.get_jenkins_credentials()
 JENKINS_URL = jenkins_creds.get('url', 'http://54.81.172.67:8080')
 JENKINS_TOKEN = jenkins_creds.get('token', 'ct-trigger-token')
-JENKINS_USERNAME = jenkins_creds.get('username', 'Gajanan Wagalgave')
+JENKINS_USERNAME = jenkins_creds.get('username', 'Gajju9191')
 JENKINS_API_TOKEN = jenkins_creds.get('api_token', '')
 JOB_NAME = "ecs-cicd-d"
 
 # ============================================================
-# CONFIGURATION
+# EVENT-DRIVEN CONFIGURATION
 # ============================================================
 IMPROVEMENT_THRESHOLD = 1.0  # Minimum improvement to deploy (%)
-DRIFT_THRESHOLD = 15.0  # Drift percentage to trigger retraining
+DRIFT_THRESHOLD = 10.0  # Drift percentage to trigger retraining
+PERFORMANCE_THRESHOLD = 0.85  # Minimum accuracy before retraining (85%)
+MIN_IMPROVEMENT = 0.02  # At least 2% improvement to deploy
 
-# VGG16 Training parameters (CONSISTENT with deployment)
+# VGG16 Training parameters
 BATCH_SIZE = 12
 EPOCHS = 15
 LEARNING_RATE = 0.001
@@ -78,35 +78,203 @@ VALIDATION_SPLIT = 0.2
 IMAGE_SIZE = (224, 224)
 
 # ============================================================
-# DATA LOADING (FIXED: Handles nested directory)
+# ALERT SYSTEM
+# ============================================================
+
+def send_email_alert(subject, message, severity="INFO"):
+    """Send email alert via AWS SNS"""
+    try:
+        sns = boto3.client('sns', region_name=AWS_REGION)
+        topic_arn = "arn:aws:sns:us-east-1:437619427369:chest-ct-alerts"
+        
+        full_message = f"""
+        ═══════════════════════════════════════════════════════
+        CHEST CT MLOPS ALERT
+        ═══════════════════════════════════════════════════════
+        
+        Severity: {severity}
+        Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+        
+        {message}
+        
+        ═══════════════════════════════════════════════════════
+        """
+        
+        response = sns.publish(
+            TopicArn=topic_arn,
+            Subject=f"[{severity}] {subject}",
+            Message=full_message
+        )
+        logger.info(f"✅ Alert sent: {subject}")
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️ Could not send email alert: {e}")
+        return False
+
+# ============================================================
+# TRIGGER DETECTION FUNCTIONS
+# ============================================================
+
+def should_retrain_due_to_drift(reference_features_path='/tmp/reference_features.npy'):
+    """Check if drift threshold is exceeded"""
+    try:
+        s3 = boto3.client('s3')
+        s3.download_file(MODEL_BUCKET, 'reference_features.npy', reference_features_path)
+        reference_data = np.load(reference_features_path)
+        logger.info("✅ Loaded reference data for drift check")
+    except:
+        logger.info("ℹ️ No reference data found. First retraining will establish baseline.")
+        return True  # First run should always retrain
+    
+    try:
+        # Check latest drift report
+        response = s3.get_object(
+            Bucket=MODEL_BUCKET,
+            Key='drift_reports/latest_training_drift.json'
+        )
+        drift_report = json.loads(response['Body'].read())
+        
+        drift_pct = drift_report.get('drift_percentage', 0)
+        logger.info(f"📊 Last drift percentage: {drift_pct:.1f}%")
+        
+        if drift_pct > DRIFT_THRESHOLD:
+            logger.info(f"🚨 Drift ({drift_pct:.1f}%) exceeds threshold ({DRIFT_THRESHOLD}%)")
+            return True
+        else:
+            logger.info(f"✅ Drift ({drift_pct:.1f}%) below threshold ({DRIFT_THRESHOLD}%)")
+            return False
+            
+    except Exception as e:
+        logger.warning(f"⚠️ Could not check drift: {e}")
+        return True  # Retrain if can't check
+
+def should_retrain_due_to_performance():
+    """Check if production model performance has dropped below threshold"""
+    try:
+        s3 = boto3.client('s3')
+        
+        # Get production model accuracy from MLflow or S3
+        # Check if we have a recent evaluation
+        try:
+            response = s3.get_object(
+                Bucket=MODEL_BUCKET,
+                Key='evaluation_metrics.json'
+            )
+            metrics = json.loads(response['Body'].read())
+            current_accuracy = metrics.get('accuracy', 1.0)
+        except:
+            # If no metrics, assume model is good
+            current_accuracy = 1.0
+        
+        logger.info(f"📊 Current production accuracy: {current_accuracy:.2%}")
+        
+        if current_accuracy < PERFORMANCE_THRESHOLD:
+            logger.info(f"🚨 Performance ({current_accuracy:.2%}) below threshold ({PERFORMANCE_THRESHOLD:.2%})")
+            return True
+        else:
+            logger.info(f"✅ Performance ({current_accuracy:.2%}) above threshold ({PERFORMANCE_THRESHOLD:.2%})")
+            return False
+            
+    except Exception as e:
+        logger.warning(f"⚠️ Could not check performance: {e}")
+        return True  # Retrain if can't check
+
+def should_retrain_due_to_new_data():
+    """Check if new data has arrived since last retraining"""
+    try:
+        s3 = boto3.client('s3')
+        
+        # Check when data was last modified
+        response = s3.head_object(
+            Bucket=DATA_BUCKET,
+            Key='chest-data.zip'
+        )
+        data_last_modified = response['LastModified']
+        
+        # Check when last retraining happened
+        try:
+            response = s3.head_object(
+                Bucket=MODEL_BUCKET,
+                Key='retraining_history/last_run.txt'
+            )
+            last_retraining = response['LastModified']
+        except:
+            last_retraining = datetime(2024, 1, 1)  # Long time ago
+        
+        logger.info(f"📅 Data last modified: {data_last_modified}")
+        logger.info(f"📅 Last retraining: {last_retraining}")
+        
+        # If data is newer than last retraining
+        if data_last_modified > last_retraining:
+            logger.info("🆕 New data detected since last retraining")
+            return True
+        else:
+            logger.info("✅ No new data since last retraining")
+            return False
+            
+    except Exception as e:
+        logger.warning(f"⚠️ Could not check new data: {e}")
+        return False  # Don't retrain if can't check
+
+def check_retraining_triggers():
+    """
+    Check all triggers and determine if retraining is needed
+    Returns: (should_retrain, trigger_reason)
+    """
+    reasons = []
+    
+    # Check drift
+    if should_retrain_due_to_drift():
+        reasons.append("Data drift detected")
+    
+    # Check performance
+    if should_retrain_due_to_performance():
+        reasons.append("Model performance dropped below threshold")
+    
+    # Check new data
+    if should_retrain_due_to_new_data():
+        reasons.append("New data available")
+    
+    # Default: First run
+    if not reasons:
+        # Check if this is first run (no model exists)
+        s3 = boto3.client('s3')
+        try:
+            s3.head_object(Bucket=MODEL_BUCKET, Key='production/model.h5')
+            # Model exists, no triggers
+            logger.info("✅ No retraining triggers detected")
+            return False, "No triggers detected"
+        except:
+            # No model exists - first run
+            reasons.append("First run - no production model")
+    
+    if reasons:
+        return True, ", ".join(reasons)
+    else:
+        return False, "No triggers detected"
+
+# ============================================================
+# DATA LOADING
 # ============================================================
 
 def fix_nested_directory(data_path):
     """Fix nested directory structure if needed"""
-    # Check if there's only one directory and it's the nested one
     items = list(data_path.iterdir())
     
     if len(items) == 1 and items[0].is_dir():
         inner_dir = items[0]
-        # Check if the inner directory contains class folders
         inner_items = list(inner_dir.iterdir())
         if inner_items and all(item.is_dir() for item in inner_items):
             logger.info(f"📁 Found nested directory structure: {inner_dir.name}")
-            logger.info(f"   Moving {len(inner_items)} class folders up one level...")
-            
-            # Move all items from inner directory to parent
             for item in inner_items:
                 target_path = data_path / item.name
                 if target_path.exists():
                     shutil.rmtree(target_path)
                 shutil.move(str(item), str(target_path))
                 logger.info(f"   ✅ Moved: {item.name}")
-            
-            # Remove the empty inner directory
             inner_dir.rmdir()
             logger.info("✅ Fixed nested directory structure!")
             return True
-    
     return False
 
 
@@ -121,12 +289,10 @@ def download_training_data():
         s3.download_file(DATA_BUCKET, 'chest-data.zip', zip_path)
         logger.info("✅ Downloaded data from S3")
         
-        # Extract zip
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(data_path)
         logger.info(f"✅ Extracted data to {data_path}")
         
-        # ✅ FIX: Fix nested directory if needed
         fix_nested_directory(data_path)
         
         # Verify data structure
@@ -139,7 +305,13 @@ def download_training_data():
         return data_path
         
     except Exception as e:
-        logger.error(f"❌ Data download failed: {e}")
+        error_msg = f"Data download failed: {e}"
+        logger.error(f"❌ {error_msg}")
+        send_email_alert(
+            "⚠️ RETRAINING DATA DOWNLOAD FAILED",
+            f"Failed to download training data from S3.\nError: {e}\nBucket: {DATA_BUCKET}",
+            severity="ERROR"
+        )
         raise
 
 # ============================================================
@@ -236,12 +408,10 @@ def train_vgg16_model(model, data_path):
     logger.info(f"✅ Training samples: {train_generator.samples}")
     logger.info(f"✅ Validation samples: {val_generator.samples}")
     
-    # Early stopping if not enough samples
     if train_generator.samples < 10 or val_generator.samples < 10:
-        logger.warning("⚠️ Not enough samples for training! Check data path.")
+        logger.warning("⚠️ Not enough samples for training!")
         return model, train_generator, val_generator, None
     
-    # Callbacks
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=7, restore_best_weights=True),
         ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4, min_lr=1e-7)
@@ -266,23 +436,20 @@ def train_vgg16_model(model, data_path):
     return model, train_generator, val_generator, history
 
 # ============================================================
-# DRIFT DETECTION (Pre-training check)
+# DRIFT DETECTION
 # ============================================================
 
 def check_data_drift(data_path):
     """Run drift detection on new training data"""
     logger.info("📊 Running pre-training drift detection...")
     
-    # Extract features for drift detection (MONITORING ONLY)
     feature_pipeline = FeaturePipeline({
         'use_pca': True,
         'pca_components': 50
     })
     
-    # Extract features (only for drift detection)
     X, y, metadata = feature_pipeline.extract_features(data_path)
     
-    # Check if features were extracted
     if len(X) == 0:
         logger.warning("⚠️ No features extracted for drift detection. Skipping...")
         return {
@@ -292,17 +459,13 @@ def check_data_drift(data_path):
         }
     
     X_transformed = feature_pipeline.fit_transform(X)
-    
-    # Save feature pipeline for later use
     feature_pipeline.save(Path('/tmp/feature_pipeline'))
     
-    # Initialize drift detector
     drift_detector = TrainingDriftDetector(
         threshold=0.05,
         feature_names=feature_pipeline.feature_names
     )
     
-    # Load reference data from S3 if exists
     try:
         s3 = boto3.client('s3')
         s3.download_file(MODEL_BUCKET, 'reference_features.npy', '/tmp/reference_features.npy')
@@ -312,17 +475,14 @@ def check_data_drift(data_path):
     except:
         logger.info("ℹ️ No reference data found. Using current batch as reference.")
     
-    # Detect drift
     drift_report = drift_detector.detect_drift(
         X_transformed,
         metadata,
         batch_id=f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     
-    # Save drift report
     drift_detector.save_report(drift_report, MODEL_BUCKET)
     
-    # Log drift metrics to MLflow (handle active run)
     try:
         mlflow.log_metrics({
             "drift_percentage": drift_report['drift_percentage'],
@@ -331,7 +491,6 @@ def check_data_drift(data_path):
     except Exception as e:
         logger.warning(f"Could not log drift metrics to MLflow: {e}")
     
-    # Save reference data for future
     np.save('/tmp/reference_features.npy', X_transformed)
     s3 = boto3.client('s3')
     s3.upload_file('/tmp/reference_features.npy', MODEL_BUCKET, 'reference_features.npy')
@@ -346,7 +505,6 @@ def compare_models(new_model, val_generator):
     """Compare new model with production model on same validation set"""
     from tensorflow.keras.models import load_model
     
-    # Check if validation generator exists
     if val_generator is None:
         logger.warning("⚠️ No validation generator available. Skipping model comparison.")
         return {
@@ -396,60 +554,98 @@ def upload_model_to_s3(model_path):
     s3 = boto3.client('s3')
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
-    # Versioned
     version_key = f"models/model_{timestamp}.h5"
     s3.upload_file(model_path, MODEL_BUCKET, version_key)
     logger.info(f"✅ Uploaded versioned model: {version_key}")
     
-    # Production
     copy_source = {'Bucket': MODEL_BUCKET, 'Key': version_key}
     s3.copy_object(CopySource=copy_source, Bucket=MODEL_BUCKET, Key='production/model.h5')
     logger.info("✅ Updated production model")
     
-    # Root (for Jenkins)
     s3.copy_object(CopySource=copy_source, Bucket=MODEL_BUCKET, Key='model.h5')
     logger.info("✅ Copied model to root path")
+    
+    # Update retraining history
+    s3.put_object(
+        Bucket=MODEL_BUCKET,
+        Key='retraining_history/last_run.txt',
+        Body=datetime.now().isoformat()
+    )
     
     return version_key
 
 
 def trigger_jenkins():
-    """Trigger Jenkins deployment"""
+    """Trigger Jenkins deployment with CSRF crumb"""
     try:
-        # Get CSRF crumb
         crumb_url = f"{JENKINS_URL}/crumbIssuer/api/json"
-        crumb_resp = requests.get(crumb_url, timeout=30)
+        logger.info(f"🔑 Getting CSRF crumb...")
         
-        headers = {}
+        crumb_resp = requests.get(
+            crumb_url,
+            auth=(JENKINS_USERNAME, JENKINS_API_TOKEN),
+            timeout=30
+        )
+        
         if crumb_resp.status_code == 200:
             crumb_data = crumb_resp.json()
             crumb = crumb_data['crumb']
             crumb_field = crumb_data['crumbRequestField']
+            logger.info(f"✅ CSRF crumb obtained")
+            
+            url = f"{JENKINS_URL}/job/{JOB_NAME}/build"
             headers = {crumb_field: crumb}
-        
-        url = f"{JENKINS_URL}/job/{JOB_NAME}/build?token={JENKINS_TOKEN}"
-        response = requests.post(url, headers=headers, timeout=30)
-        
-        if response.status_code == 201:
-            logger.info("✅ Jenkins build triggered successfully!")
-            return True
+            
+            response = requests.post(
+                url,
+                headers=headers,
+                auth=(JENKINS_USERNAME, JENKINS_API_TOKEN),
+                timeout=30
+            )
+            
+            if response.status_code == 201 or response.status_code == 200:
+                logger.info("✅ Jenkins build triggered successfully!")
+                return True
+            else:
+                logger.error(f"❌ Jenkins trigger failed: {response.status_code}")
+                return False
+        else:
+            logger.error(f"❌ Failed to get CSRF crumb: {crumb_resp.status_code}")
+            return False
+            
     except Exception as e:
-        logger.error(f"❌ Jenkins trigger failed: {e}")
-    return False
+        logger.error(f"❌ Error triggering Jenkins: {e}")
+        return False
 
 # ============================================================
 # MAIN RETRAINING PIPELINE
 # ============================================================
 
 def main():
-    """Main retraining pipeline with VGG16 on raw images"""
+    """Event-driven retraining pipeline"""
     logger.info("=" * 60)
-    logger.info("🔄 Starting VGG16 Retraining Pipeline (Raw Images)")
-    logger.info(f"📊 Epochs: {EPOCHS}")
+    logger.info("🔄 Starting Event-Driven VGG16 Retraining Pipeline")
     logger.info("=" * 60)
+    
+    # Step 1: Check if retraining is needed
+    should_retrain, trigger_reason = check_retraining_triggers()
+    
+    if not should_retrain:
+        logger.info(f"⏸️ Skipping retraining: {trigger_reason}")
+        return
+    
+    logger.info(f"📋 Retraining triggered by: {trigger_reason}")
+    send_email_alert(
+        "🔄 Retraining Triggered",
+        f"Retraining started due to: {trigger_reason}",
+        severity="INFO"
+    )
     
     try:
         with mlflow.start_run(run_name=f"retraining_vgg16_{datetime.now().strftime('%Y%m%d_%H%M%S')}"):
+            # Log trigger reason
+            mlflow.log_param("trigger_reason", trigger_reason)
+            
             # Log parameters
             mlflow.log_params({
                 "model_architecture": "VGG16",
@@ -460,35 +656,34 @@ def main():
                 "validation_split": VALIDATION_SPLIT,
                 "drift_threshold": DRIFT_THRESHOLD,
                 "improvement_threshold": IMPROVEMENT_THRESHOLD,
-                "training_data": "raw_images"
+                "performance_threshold": PERFORMANCE_THRESHOLD
             })
             
-            # Step 1: Download data (FIXED)
+            # Step 2: Download data
             logger.info("📥 Downloading training data...")
             data_path = download_training_data()
             
-            # Step 2: Check data drift (pre-training check)
+            # Step 3: Check data drift
             logger.info("📊 Running pre-training drift detection...")
             drift_report = check_data_drift(data_path)
             
-            # Extract recommendation properly
             rec_message = drift_report.get('recommendation', 'No recommendation')
             if isinstance(rec_message, list):
                 rec_message = rec_message[0].get('message', 'No recommendation') if rec_message else 'No recommendation'
             logger.info(f"📊 Drift: {drift_report['drift_percentage']:.1f}% - {rec_message}")
             
-            # Step 3: Create VGG16 model (identical to deployment)
+            # Step 4: Create VGG16 model
             model = create_vgg16_model()
             
-            # Step 4: Train on raw images (15 epochs)
+            # Step 5: Train on raw images
             model, train_generator, val_generator, history = train_vgg16_model(model, data_path)
             
-            # Step 5: Save model
+            # Step 6: Save model
             model_path = '/tmp/model.h5'
             model.save(model_path)
             logger.info(f"✅ Model saved to {model_path}")
             
-            # Step 6: Compare with production model
+            # Step 7: Compare with production model
             logger.info("⚖️ Comparing models...")
             comparison = compare_models(model, val_generator)
             
@@ -498,23 +693,62 @@ def main():
                 "improvement": comparison['improvement']
             })
             
-            # Step 7: Deploy if improved
+            # Step 8: Deploy if improved
             if comparison['should_deploy']:
                 logger.info(f"✅ Model improved by {comparison['improvement']:.2f}%")
                 version = upload_model_to_s3(model_path)
-                trigger_jenkins()
+                jenkins_triggered = trigger_jenkins()
+                
                 mlflow.log_param("deployed_version", version)
                 mlflow.log_param("deployed", True)
+                
+                send_email_alert(
+                    "✅ NEW MODEL DEPLOYED!",
+                    f"""
+                    Retraining triggered by: {trigger_reason}
+                    
+                    New Model Accuracy: {comparison['new_accuracy']:.2%}
+                    Old Model Accuracy: {comparison['prod_accuracy']:.2%}
+                    Improvement: +{comparison['improvement']:.2f}%
+                    Model Version: {version}
+                    Jenkins Triggered: {jenkins_triggered}
+                    """,
+                    severity="SUCCESS"
+                )
             else:
                 logger.info(f"⏸️ No significant improvement: {comparison['improvement']:.2f}%")
                 mlflow.log_param("deployed", False)
+                
+                send_email_alert(
+                    "ℹ️ No Model Improvement",
+                    f"""
+                    Retraining triggered by: {trigger_reason}
+                    
+                    New Model Accuracy: {comparison['new_accuracy']:.2%}
+                    Old Model Accuracy: {comparison['prod_accuracy']:.2%}
+                    Improvement: {comparison['improvement']:.2f}%
+                    Threshold: {IMPROVEMENT_THRESHOLD}%
+                    """,
+                    severity="INFO"
+                )
             
             logger.info("=" * 60)
             logger.info("✅ Retraining pipeline completed successfully!")
             logger.info("=" * 60)
             
     except Exception as e:
-        logger.error(f"❌ Retraining failed: {e}")
+        error_msg = f"Retraining failed: {e}"
+        logger.error(f"❌ {error_msg}")
+        
+        send_email_alert(
+            "❌ RETRAINING FAILED",
+            f"""
+            Trigger Reason: {trigger_reason}
+            Error: {e}
+            Check CloudWatch logs for details.
+            """,
+            severity="ERROR"
+        )
         raise
 
 

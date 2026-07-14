@@ -1,4 +1,3 @@
-
 variable "aws_region" {
   description = "AWS region"
   default     = "us-east-1"
@@ -38,8 +37,45 @@ variable "job_memory" {
   default     = 16384
 }
 
+variable "jenkins_url" {
+  description = "Jenkins server URL"
+  type        = string
+  sensitive   = true
+}
+
+variable "jenkins_token" {
+  description = "Jenkins webhook token"
+  type        = string
+  sensitive   = true
+}
+
+variable "jenkins_username" {
+  description = "Jenkins username"
+  type        = string
+  default     = "Gajju9191"
+}
+
+variable "jenkins_api_token" {
+  description = "Jenkins API token"
+  type        = string
+  sensitive   = true
+}
+
 variable "dagshub_token" {
   description = "DAGsHub access token for MLflow tracking"
   type        = string
   sensitive   = true
+}
+
+# ✅ NEW: Alert variables
+variable "alert_email" {
+  description = "Email address for alerts"
+  type        = string
+  default     = "gajananw131gmail.com"
+}
+
+variable "alert_phone" {
+  description = "Phone number for SMS alerts (optional)"
+  type        = string
+  default     = ""
 }
