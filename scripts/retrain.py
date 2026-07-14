@@ -5,6 +5,7 @@ Retraining Pipeline with VGG16 on Raw Images
 - Feature pipeline used ONLY for drift detection
 - Fair model comparison
 - 15 epochs for better training
+- FIXED: Handles nested directory structure
 """
 import os
 import sys
@@ -21,6 +22,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 import requests
 import zipfile
+import shutil
 
 # Import modules
 from feature_pipeline import FeaturePipeline
@@ -70,14 +72,43 @@ DRIFT_THRESHOLD = 15.0  # Drift percentage to trigger retraining
 
 # VGG16 Training parameters (CONSISTENT with deployment)
 BATCH_SIZE = 12
-EPOCHS = 15  # ✅ UPDATED: 15 epochs for better training
+EPOCHS = 15
 LEARNING_RATE = 0.001
 VALIDATION_SPLIT = 0.2
 IMAGE_SIZE = (224, 224)
 
 # ============================================================
-# DATA LOADING
+# DATA LOADING (FIXED: Handles nested directory)
 # ============================================================
+
+def fix_nested_directory(data_path):
+    """Fix nested directory structure if needed"""
+    # Check if there's only one directory and it's the nested one
+    items = list(data_path.iterdir())
+    
+    if len(items) == 1 and items[0].is_dir():
+        inner_dir = items[0]
+        # Check if the inner directory contains class folders
+        inner_items = list(inner_dir.iterdir())
+        if inner_items and all(item.is_dir() for item in inner_items):
+            logger.info(f"📁 Found nested directory structure: {inner_dir.name}")
+            logger.info(f"   Moving {len(inner_items)} class folders up one level...")
+            
+            # Move all items from inner directory to parent
+            for item in inner_items:
+                target_path = data_path / item.name
+                if target_path.exists():
+                    shutil.rmtree(target_path)
+                shutil.move(str(item), str(target_path))
+                logger.info(f"   ✅ Moved: {item.name}")
+            
+            # Remove the empty inner directory
+            inner_dir.rmdir()
+            logger.info("✅ Fixed nested directory structure!")
+            return True
+    
+    return False
+
 
 def download_training_data():
     """Download and extract training data from S3"""
@@ -90,16 +121,29 @@ def download_training_data():
         s3.download_file(DATA_BUCKET, 'chest-data.zip', zip_path)
         logger.info("✅ Downloaded data from S3")
         
+        # Extract zip
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(data_path)
         logger.info(f"✅ Extracted data to {data_path}")
+        
+        # ✅ FIX: Fix nested directory if needed
+        fix_nested_directory(data_path)
+        
+        # Verify data structure
+        class_dirs = [d for d in data_path.iterdir() if d.is_dir()]
+        logger.info(f"📊 Found {len(class_dirs)} class directories:")
+        for class_dir in class_dirs:
+            image_count = len(list(class_dir.glob('*.[jp][pn][g]')))
+            logger.info(f"   - {class_dir.name}: {image_count} images")
+        
         return data_path
+        
     except Exception as e:
         logger.error(f"❌ Data download failed: {e}")
         raise
 
 # ============================================================
-# VGG16 MODEL (CONSISTENT WITH DEPLOYMENT)
+# VGG16 MODEL
 # ============================================================
 
 def create_vgg16_model():
@@ -144,11 +188,15 @@ def train_vgg16_model(model, data_path):
     from tensorflow.keras.preprocessing.image import ImageDataGenerator
     from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
     
-    # ✅ DEBUG: Check data structure
+    # Check data structure
     logger.info(f"📁 Checking data path: {data_path}")
     class_dirs = [d for d in data_path.iterdir() if d.is_dir()]
-    logger.info(f"Found {len(class_dirs)} class directories: {[d.name for d in class_dirs]}")
     
+    if len(class_dirs) == 0:
+        logger.error(f"❌ No class directories found in {data_path}")
+        return model, None, None, None
+    
+    logger.info(f"Found {len(class_dirs)} class directories: {[d.name for d in class_dirs]}")
     for class_dir in class_dirs:
         image_count = len(list(class_dir.glob('*.[jp][pn][g]')))
         logger.info(f"  - {class_dir.name}: {image_count} images")
@@ -233,6 +281,16 @@ def check_data_drift(data_path):
     
     # Extract features (only for drift detection)
     X, y, metadata = feature_pipeline.extract_features(data_path)
+    
+    # Check if features were extracted
+    if len(X) == 0:
+        logger.warning("⚠️ No features extracted for drift detection. Skipping...")
+        return {
+            'drift_percentage': 0,
+            'drifted_features': 0,
+            'recommendation': 'No drift detection - insufficient data'
+        }
+    
     X_transformed = feature_pipeline.fit_transform(X)
     
     # Save feature pipeline for later use
@@ -281,12 +339,22 @@ def check_data_drift(data_path):
     return drift_report
 
 # ============================================================
-# MODEL COMPARISON (Fair comparison)
+# MODEL COMPARISON
 # ============================================================
 
 def compare_models(new_model, val_generator):
     """Compare new model with production model on same validation set"""
     from tensorflow.keras.models import load_model
+    
+    # Check if validation generator exists
+    if val_generator is None:
+        logger.warning("⚠️ No validation generator available. Skipping model comparison.")
+        return {
+            'new_accuracy': 0,
+            'prod_accuracy': 0,
+            'improvement': 0,
+            'should_deploy': False
+        }
     
     # Evaluate new model
     new_loss, new_accuracy = new_model.evaluate(val_generator, verbose=0)
@@ -395,7 +463,7 @@ def main():
                 "training_data": "raw_images"
             })
             
-            # Step 1: Download data
+            # Step 1: Download data (FIXED)
             logger.info("📥 Downloading training data...")
             data_path = download_training_data()
             
