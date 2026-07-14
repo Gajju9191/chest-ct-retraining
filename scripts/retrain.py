@@ -4,6 +4,7 @@ Retraining Pipeline with VGG16 on Raw Images
 - Consistent with deployment model
 - Feature pipeline used ONLY for drift detection
 - Fair model comparison
+- 15 epochs for better training
 """
 import os
 import sys
@@ -69,7 +70,7 @@ DRIFT_THRESHOLD = 15.0  # Drift percentage to trigger retraining
 
 # VGG16 Training parameters (CONSISTENT with deployment)
 BATCH_SIZE = 12
-EPOCHS = 10
+EPOCHS = 15  # ✅ UPDATED: 15 epochs for better training
 LEARNING_RATE = 0.001
 VALIDATION_SPLIT = 0.2
 IMAGE_SIZE = (224, 224)
@@ -120,8 +121,11 @@ def create_vgg16_model():
     model = Sequential([
         base_model,
         GlobalAveragePooling2D(),
-        Dense(128, activation='relu'),
+        Dense(256, activation='relu'),
+        BatchNormalization(),
         Dropout(0.5),
+        Dense(128, activation='relu'),
+        Dropout(0.3),
         Dense(2, activation='softmax')
     ])
     
@@ -136,11 +140,20 @@ def create_vgg16_model():
 
 
 def train_vgg16_model(model, data_path):
-    """Train VGG16 on raw images"""
+    """Train VGG16 on raw images with 15 epochs"""
     from tensorflow.keras.preprocessing.image import ImageDataGenerator
     from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
     
-    # Data augmentation (same as deployment)
+    # ✅ DEBUG: Check data structure
+    logger.info(f"📁 Checking data path: {data_path}")
+    class_dirs = [d for d in data_path.iterdir() if d.is_dir()]
+    logger.info(f"Found {len(class_dirs)} class directories: {[d.name for d in class_dirs]}")
+    
+    for class_dir in class_dirs:
+        image_count = len(list(class_dir.glob('*.[jp][pn][g]')))
+        logger.info(f"  - {class_dir.name}: {image_count} images")
+    
+    # Data augmentation
     datagen = ImageDataGenerator(
         rescale=1./255,
         rotation_range=20,
@@ -171,12 +184,22 @@ def train_vgg16_model(model, data_path):
         shuffle=False
     )
     
-    logger.info(f"🚀 Training VGG16 on {train_generator.samples} images...")
+    logger.info(f"✅ Classes: {train_generator.class_indices}")
+    logger.info(f"✅ Training samples: {train_generator.samples}")
+    logger.info(f"✅ Validation samples: {val_generator.samples}")
     
+    # Early stopping if not enough samples
+    if train_generator.samples < 10 or val_generator.samples < 10:
+        logger.warning("⚠️ Not enough samples for training! Check data path.")
+        return model, train_generator, val_generator, None
+    
+    # Callbacks
     callbacks = [
-        EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-7)
+        EarlyStopping(monitor='val_loss', patience=7, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4, min_lr=1e-7)
     ]
+    
+    logger.info(f"🚀 Training VGG16 on {train_generator.samples} images for {EPOCHS} epochs...")
     
     history = model.fit(
         train_generator,
@@ -354,6 +377,7 @@ def main():
     """Main retraining pipeline with VGG16 on raw images"""
     logger.info("=" * 60)
     logger.info("🔄 Starting VGG16 Retraining Pipeline (Raw Images)")
+    logger.info(f"📊 Epochs: {EPOCHS}")
     logger.info("=" * 60)
     
     try:
@@ -379,7 +403,7 @@ def main():
             logger.info("📊 Running pre-training drift detection...")
             drift_report = check_data_drift(data_path)
             
-            # ✅ FIXED: Extract recommendation properly
+            # Extract recommendation properly
             rec_message = drift_report.get('recommendation', 'No recommendation')
             if isinstance(rec_message, list):
                 rec_message = rec_message[0].get('message', 'No recommendation') if rec_message else 'No recommendation'
@@ -388,7 +412,7 @@ def main():
             # Step 3: Create VGG16 model (identical to deployment)
             model = create_vgg16_model()
             
-            # Step 4: Train on raw images
+            # Step 4: Train on raw images (15 epochs)
             model, train_generator, val_generator, history = train_vgg16_model(model, data_path)
             
             # Step 5: Save model
