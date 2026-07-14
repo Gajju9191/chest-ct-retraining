@@ -241,11 +241,14 @@ def check_data_drift(data_path):
     # Save drift report
     drift_detector.save_report(drift_report, MODEL_BUCKET)
     
-    # Log drift metrics
-    mlflow.log_metrics({
-        "drift_percentage": drift_report['drift_percentage'],
-        "drifted_features": drift_report['drifted_features']
-    })
+    # Log drift metrics to MLflow (handle active run)
+    try:
+        mlflow.log_metrics({
+            "drift_percentage": drift_report['drift_percentage'],
+            "drifted_features": drift_report['drifted_features']
+        })
+    except Exception as e:
+        logger.warning(f"Could not log drift metrics to MLflow: {e}")
     
     # Save reference data for future
     np.save('/tmp/reference_features.npy', X_transformed)
@@ -373,8 +376,14 @@ def main():
             data_path = download_training_data()
             
             # Step 2: Check data drift (pre-training check)
+            logger.info("📊 Running pre-training drift detection...")
             drift_report = check_data_drift(data_path)
-            logger.info(f"📊 Drift: {drift_report['drift_percentage']:.1f}% - {drift_report['recommendation']}")
+            
+            # ✅ FIXED: Extract recommendation properly
+            rec_message = drift_report.get('recommendation', 'No recommendation')
+            if isinstance(rec_message, list):
+                rec_message = rec_message[0].get('message', 'No recommendation') if rec_message else 'No recommendation'
+            logger.info(f"📊 Drift: {drift_report['drift_percentage']:.1f}% - {rec_message}")
             
             # Step 3: Create VGG16 model (identical to deployment)
             model = create_vgg16_model()
